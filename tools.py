@@ -11,6 +11,8 @@ from matplotlib import pyplot as plt
 from matplotlib_inline import backend_inline
 import requests
 import torch
+from pycparser.ply.yacc import token
+from scripts.regsetup import examples
 from torch import nn
 import torchvision
 from torch.utils import data
@@ -1504,3 +1506,281 @@ class TokenEmbedding:
 
     def __len__(self):
         return len(self.idx_to_token)
+
+
+def get_tokens_and_segments(tokens_a, tokens_b=None):
+    tokens = ['<cls>'] + tokens_a + ['<sep>']
+    segments = [0] * (len(tokens_a) + 2)
+    if tokens_b is not None:
+        tokens += tokens_b + ['<sep>']
+        segments += [1] * (len(tokens_b) + 1)
+    return tokens, segments
+
+
+class BERTEncoder(nn.Module):
+    def __init__(self, vocab_size, num_hiddens, norm_shape, ffn_num_input,
+                 ffn_num_hiddens, num_heads, num_layers, dropout,
+                 max_len=1000, key_size=768, query_size=768, value_size=768,
+                 **kwargs):
+        super(BERTEncoder, self).__init__(**kwargs)
+        self.token_embedding = nn.Embedding(vocab_size, num_hiddens)
+        self.segment_embedding = nn.Embedding(2, num_hiddens)
+        self.blks = nn.Sequential()
+        for i in range(num_layers):
+            self.blks.add_module(
+                f'block{i}',
+                EncoderBlock(key_size, query_size, value_size, num_hiddens,
+                             norm_shape, ffn_num_input, ffn_num_hiddens,
+                             num_heads, dropout, True))
+        self.pos_encoding = nn.Parameter(torch.randn(1, max_len, num_hiddens))
+
+    def forward(self, tokens, segments, valid_lens):
+        X = self.token_embedding(tokens) + self.segment_embedding(segments)
+        X = X + self.pos_encoding.data[:, :X.shape[1], :]
+        for blk in self.blks:
+            X = blk(X, valid_lens)
+        return X
+
+
+class MaskLM(nn.Module):
+    def __init__(self, vocab_size, num_hiddens, num_inputs=768, **kwags):
+        super(MaskLM, self).__init__(**kwags)
+        self.mlp = nn.Sequential(nn.Linear(num_inputs, num_hiddens),
+                                 nn.ReLU(),
+                                 nn.LayerNorm(num_hiddens),
+                                 nn.Linear(num_hiddens, vocab_size))
+
+    def forward(self, X, pred_positions):
+        num_pred_positions = pred_positions.shape[1]
+        pred_positions = pred_positions.reshape(-1)
+        batch_size = X.shape[0]
+        batch_idx = torch.arange(0, batch_size)
+        batch_idx = torch.repeat_interleave(batch_idx, num_pred_positions)
+        masked_X = X[batch_idx, pred_positions]
+        masked_X = masked_X.reshape((batch_size, num_pred_positions, -1))
+        mlm_Y_hat = self.mlp(masked_X)
+        return mlm_Y_hat
+
+
+class NextSentencePred(nn.Module):
+    def __init__(self, num_inputs, **kwargs):
+        super(NextSentencePred, self).__init__(**kwargs)
+        self.output = nn.Linear(num_inputs, 2)
+
+    def forward(self, X):
+        return self.output(X)
+
+
+class BERTModel(nn.Module):
+    def __init__(self, vocab_size, num_hiddens, norm_shape, ffn_num_input,
+                 ffn_num_hiddens, num_heads, num_layers, dropout,
+                 max_len=1000, key_size=768, query_size=768, value_size=768,
+                 hid_in_features=768, mlm_in_features=768,
+                 nsp_in_features=768):
+        super(BERTModel, self).__init__()
+        self.encoder = BERTEncoder(vocab_size, num_hiddens, norm_shape,
+                                   ffn_num_input, ffn_num_hiddens, num_heads, num_layers,
+                                   dropout, max_len=max_len, key_size=key_size,
+                                   query_size=query_size, value_size=value_size)
+        self.hidden = nn.Sequential(nn.Linear(hid_in_features, num_hiddens),
+                                    nn.Tanh())
+        self.mlm = MaskLM(vocab_size, num_hiddens, mlm_in_features)
+        self.nsp = NextSentencePred(nsp_in_features)
+
+    def forward(self, tokens, segments, valid_lens=None,
+                pred_positions=None):
+        encoder_X = self.encoder(tokens, segments, valid_lens)
+        if pred_positions is not None:
+            mlm_Y_hat = self.mlm(encoder_X, pred_positions)
+        else:
+            mlm_Y_hat = None
+        nsp_Y_hat = self.nsp(self.hidden(encoder_X[:, 0, :]))
+        return encoder_X, mlm_Y_hat, nsp_Y_hat
+
+
+DATA_HUB['wikitext-2'] = (
+    'https://s3.amazonaws.com/research.metamind.io/wikitext/' +
+    'wikitext-2-v1.zip', '3c914d17d80b1459be871a5039ac23e752a53cbe')
+
+
+def _read_wiki(data_dir):
+    file_name = os.path.join(data_dir, 'wiki.train.tokens')
+    with open(file_name, 'r') as f:
+        lines = f.readlines()
+    paragraphs = [line.strip().lower().split(' . ')
+                  for line in lines if len(line.split(' . ')) >= 2]
+    random.shuffle(paragraphs)
+    return paragraphs
+
+
+def _get_next_sentence(sentence, next_sentence, paragraphs):
+    if random.random() < 0.5:
+        is_next = True
+    else:
+        next_sentence = random.choice(random.choice(paragraphs))
+        is_next = False
+    return sentence, next_sentence, is_next
+
+
+def _get_nsp_data_from_paragraph(paragraph, paragraphs, vocab, max_len):
+    nsp_data_from_paragraph = []
+    for i in range(len(paragraph) - 1):
+        tokens_a, tokens_b, is_next = _get_next_sentence(
+            paragraph[i], paragraph[i + 1], paragraphs)
+        if len(tokens_a) + len(tokens_b) + 3 > max_len:
+            continue
+        tokens, segments = get_tokens_and_segments(tokens_a, tokens_b)
+        nsp_data_from_paragraph.append((tokens, segments, is_next))
+
+
+def _replace_mlm_tokens(tokens, candidate_pred_positions, num_mlm_preds,
+                        vocab):
+    mlm_input = [token for token in tokens]
+    pred_positions_and_labels = []
+    random.shuffle(candidate_pred_positions)
+    for mlm_pred_position in candidate_pred_positions:
+        if len(pred_positions_and_labels) >= num_mlm_preds:
+            break
+        masked_token = None
+        if random.random() < 0.8:
+            masked_token = '<mask>'
+        else:
+            if random.random() < 0.5:
+                masked_token = mlm_input[mlm_pred_position]
+            else:
+                masked_token = random.choice(list(vocab.idx_to_token))
+        mlm_input[mlm_pred_position] = masked_token
+        pred_positions_and_labels.append(
+            (mlm_pred_position, tokens[mlm_pred_position]))
+    return mlm_input, pred_positions_and_labels
+
+
+def _get_mlm_data_from_tokens(tokens, vocab):
+    candidate_pred_positions = []
+    for i, token in enumerate(tokens):
+        if token in ['<cls>', '<sep>']:
+            continue
+        candidate_pred_positions.append(i)
+    num_mlm_preds = max(1, round(len(tokens) * 0.15))
+    mlm_input, pred_positions_and_labels = _replace_mlm_tokens(
+        tokens, candidate_pred_positions, num_mlm_preds, vocab)
+    pred_positions_and_labels = sorted(pred_positions_and_labels,
+                                       key=lambda x: x[0])
+    pred_positions = [v[0] for v in pred_positions_and_labels]
+    mlm_pred_labels = [vocab[v[1]] for v in pred_positions_and_labels]
+    return vocab[mlm_input], pred_positions, mlm_pred_labels
+
+
+def _pad_bert_inputs(examples, max_len, vocab):
+    max_num_mlm_preds = round(max_len * 0.15)
+    all_token_ids, all_segments, valid_lens, = [], [], []
+    all_pred_positions, all_mlm_weights, all_mlm_labels = [], [], []
+    nsp_labels = []
+    for (token_ids, pred_positions, mlm_pred_label_ids, segments,
+         is_next) in examples:
+        all_token_ids.append(torch.tensor(token_ids + [vocab['<pad>']] * (
+                max_len - len(token_ids)), dtype=torch.long))
+        all_segments.append(torch.tensor(segments + [0] * (
+                max_len - len(segments)), dtype=torch.long))
+        valid_lens.append(torch.tensor(len(token_ids), dtype=torch.float32))
+        all_pred_positions.append(torch.tensor(pred_positions + [0] * (
+                max_num_mlm_preds - len(pred_positions)), dtype=torch.long))
+        all_mlm_weights.append(torch.tensor([1.0] * len(mlm_pred_label_ids) + [0.0] * (
+                max_num_mlm_preds - len(pred_positions)), dtype=torch.float32))
+        all_mlm_labels.append(torch.tensor(mlm_pred_label_ids + [0] * (
+                max_num_mlm_preds - len(mlm_pred_label_ids)), dtype=torch.long))
+        nsp_labels.append(torch.tensor(is_next, dtype=torch.long))
+    return (all_token_ids, all_segments, valid_lens, all_pred_positions,
+            all_mlm_weights, all_mlm_labels, nsp_labels)
+
+
+class _WikiTextDataset(torch.utils.data.Dataset):
+    def __init__(self, paragraphs, max_len):
+        paragraphs = [tokenize(
+            paragraph, token='word') for paragraph in paragraphs]
+        sentences = [sentence for paragraph in paragraphs
+                     for sentence in paragraph]
+        self.vocab = Vocab(sentences, min_freq=5, reserved_tokens=[
+            '<pad>', '<mask>', '<cls>', '<sep>'])
+        examples = []
+        for paragraph in paragraphs:
+            examples.append(_get_nsp_data_from_paragraph(
+                paragraph, paragraphs, self.vocab, max_len))
+        examples = [(_get_mlm_data_from_tokens(tokens, self.vocab)
+                     + (segments, is_next))
+                    for tokens, segments, is_next in examples]
+        (self.all_token_ids, self.all_segments, self.valid_lens,
+         self.all_pred_positions, self.all_mlm_weights,
+         self.all_mlm_labels, self.nsp_labels) = _pad_bert_inputs(
+            examples, max_len, self.vocab)
+
+    def __getitem__(self, idx):
+        return (self.all_token_ids[idx], self.all_segments[idx],
+                self.valid_lens[idx], self.all_pred_positions[idx],
+                self.all_mlm_weights[idx], self.all_mlm_labels[idx],
+                self.nsp_labels[idx])
+
+    def __len__(self):
+        return len(self.all_token_ids)
+
+
+def load_data_wiki(batch_size, max_len):
+    data_dir = download_extract('wikitext-2', 'wikitext-2')
+    paragraphs = _read_wiki(data_dir)
+    train_set = _WikiTextDataset(paragraphs, max_len)
+    train_iter = torch.utils.data.DataLoader(train_set, batch_size,
+                                             shuffle=True)
+    return train_iter, train_set.vocab
+
+
+def _get_batch_loss_bert(net, loss, vocab_size, tokens_X,
+                         segments_X, valid_lens_x,
+                         pred_positions_X, mlm_weights_X,
+                         mlm_Y, nsp_y):
+    _, mlm_Y_hat, nsp_Y_hat = net(tokens_X, segments_X,
+                                  valid_lens_x.reshape(-1),
+                                  pred_positions_X)
+    mlm_l = loss(mlm_Y_hat.reshape(-1, vocab_size), mlm_Y.reshape(-1)) * \
+            mlm_weights_X.reshape(-1, 1)
+    mlm_l = mlm_l.sum() / (mlm_weights_X.sum() + 1e-8)
+    nsp_l = loss(nsp_Y_hat, nsp_y)
+    l = mlm_l + nsp_l
+    return mlm_l, nsp_l, l
+
+
+def train_bert(train_iter, net, loss, vocab_size, devices, num_steps):
+    net = nn.DataParallel(net, device_ids=devices).to(devices[0])
+    trainer = torch.optim.Adam(net.parameters(), lr=0.01)
+    step, timer = 0, Timer()
+    animator = Animator(xlabel='step', ylabel='loss',
+                            xlim=[1, num_steps], legend=['mlm', 'nsp'])
+    metric = Accumulator(4)
+    num_steps_reached = False
+    while step < num_steps and not num_steps_reached:
+        for tokens_X, segments_X, valid_lens_x, pred_positions_X, \
+                mlm_weights_X, mlm_Y, nsp_y in train_iter:
+            tokens_X = tokens_X.to(devices[0])
+            segments_X = segments_X.to(devices[0])
+            valid_lens_x = valid_lens_x.to(devices[0])
+            pred_positions_X = pred_positions_X.to(devices[0])
+            mlm_weights_X = mlm_weights_X.to(devices[0])
+            mlm_Y, nsp_y = mlm_Y.to(devices[0]), nsp_y.to(devices[0])
+            trainer.zero_grad()
+            timer.start()
+            mlm_l, nsp_l, l = _get_batch_loss_bert(
+                net, loss, vocab_size, tokens_X, segments_X, valid_lens_x,
+                pred_positions_X, mlm_weights_X, mlm_Y, nsp_y)
+            l.backward()
+            trainer.step()
+            metric.add(mlm_l, nsp_l, tokens_X.shape[0], 1)
+            timer.stop()
+            animator.add(step + 1,
+                         (metric[0] / metric[3], metric[1] / metric[3]))
+            step += 1
+            if step == num_steps:
+                num_steps_reached = True
+            break
+    print(f'MLM loss {metric[0] / metric[3]:.3f}, '
+          f'NSP loss {metric[1] / metric[3]:.3f}')
+    print(f'{metric[2] / timer.sum():.1f} sentence pairs/sec on '
+          f'{str(devices)}')
