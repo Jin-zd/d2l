@@ -11,8 +11,6 @@ from matplotlib import pyplot as plt
 from matplotlib_inline import backend_inline
 import requests
 import torch
-from pycparser.ply.yacc import token
-from scripts.regsetup import examples
 from torch import nn
 import torchvision
 from torch.utils import data
@@ -1356,6 +1354,14 @@ def resnet18(num_classes, in_channels=1):
     return net
 
 
+
+
+
+
+
+
+
+
 DATA_HUB['ptb'] = (DATA_URL + 'ptb.zip',
                    '319d85e578af0cdc590547f26231e4e31cdf1e42')
 
@@ -1753,7 +1759,7 @@ def train_bert(train_iter, net, loss, vocab_size, devices, num_steps):
     trainer = torch.optim.Adam(net.parameters(), lr=0.01)
     step, timer = 0, Timer()
     animator = Animator(xlabel='step', ylabel='loss',
-                            xlim=[1, num_steps], legend=['mlm', 'nsp'])
+                        xlim=[1, num_steps], legend=['mlm', 'nsp'])
     metric = Accumulator(4)
     num_steps_reached = False
     while step < num_steps and not num_steps_reached:
@@ -1784,3 +1790,122 @@ def train_bert(train_iter, net, loss, vocab_size, devices, num_steps):
           f'NSP loss {metric[1] / metric[3]:.3f}')
     print(f'{metric[2] / timer.sum():.1f} sentence pairs/sec on '
           f'{str(devices)}')
+
+
+DATA_HUB['aclImdb'] = (
+    'http://ai.stanford.edu/~amaas/data/sentiment/aclImdb_v1.tar.gz',
+    '01ada507287d82875905620988597833ad4e0903')
+
+
+def read_imdb(data_dir, is_train):
+    data, labels = [], []
+    for label in ('pos', 'neg'):
+        folder_name = os.path.join(data_dir, 'train' if is_train else 'test',
+                                   label)
+    for file in os.listdir(folder_name):
+        with open(os.path.join(folder_name, file), 'rb') as f:
+            review = f.read().decode('utf-8').replace('\n', '')
+    data.append(review)
+    labels.append(1 if label == 'pos' else 0)
+    return data, labels
+
+
+def load_data_imdb(batch_size, num_steps=500):
+    data_dir = download_extract('aclImdb', 'aclImdb')
+    train_data = read_imdb(data_dir, is_train=True)
+    test_data = read_imdb(data_dir, is_train=False)
+    train_tokens = tokenize(train_data[0], token='word')
+    test_tokens = tokenize(test_data[0], token='word')
+    vocab = Vocab(train_tokens, min_freq=5)
+    train_features = torch.tensor([truncate_pad(
+        vocab[line], num_steps, vocab['<pad>']) for line in train_tokens])
+    test_features = torch.tensor([truncate_pad(
+        vocab[line], num_steps, vocab['<pad>']) for line in test_tokens])
+    train_iter = load_array((train_features, torch.tensor(train_data[1])),
+                            batch_size)
+    test_iter = load_array((test_features, torch.tensor(test_data[1])),
+                           batch_size, is_train=False)
+    return train_iter, test_iter, vocab
+
+
+def predict_sentiment(net, vocab, sentence):
+    sentence = torch.tensor([vocab[sentence.split()]], device=try_gpu())
+    label = torch.argmax(net(sentence.reshape(1, -1)), dim=1)
+    return 'positive' if label == 1 else 'negative'
+
+
+DATA_HUB['SNLI'] = ('https://nlp.stanford.edu/projects/snli/snli_1.0.zip',
+                    '9fcde07509c7e87ec61c640c1b2753d9041758e4')
+
+
+def read_snli(data_dir, is_train):
+    def extract_text(s):
+        s = re.sub('\\(', '', s)
+        s = re.sub('\\)', '', s)
+        s = re.sub('\\s{2,}', ' ', s)
+        return s.strip()
+
+    label_set = {'entailment': 0, 'neutral': 1, 'contradiction': 2}
+    file_name = os.path.join(data_dir, 'snli_1.0_train.txt' if is_train
+    else 'snli_1.0_test.txt')
+    with open(file_name, 'r') as f:
+        rows = [row.split('\t') for row in f.readlines()[1:]]
+    premises = [extract_text(row[1]) for row in rows if row[0] in label_set]
+    hypotheses = [extract_text(row[2]) for row in rows if row[0] in label_set]
+    labels = [label_set[row[0]] for row in rows if row[0] in label_set]
+    return premises, hypotheses, labels
+
+
+class SNLIDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, num_steps, vocab=None):
+        self.num_steps = num_steps
+        all_premise_tokens = tokenize(dataset[0])
+        all_hypothesis_tokens = tokenize(dataset[1])
+        if vocab is None:
+            self.vocab = Vocab(all_premise_tokens + all_hypothesis_tokens,
+                               min_freq=5, reserved_tokens=['<pad>'])
+        else:
+            self.vocab = vocab
+        self.premises = self._pad(all_premise_tokens)
+        self.hypotheses = self._pad(all_hypothesis_tokens)
+        self.labels = torch.tensor(dataset[2])
+        print('read ' + str(len(self.premises)) + ' examples')
+
+    def _pad(self, lines):
+        return torch.tensor([truncate_pad(self.vocab[line], self.num_steps,
+                                          self.vocab['<pad>']) for line in lines])
+
+    def __getitem__(self, idx):
+        return (self.premises[idx], self.hypotheses[idx]), self.labels[idx]
+
+    def __len__(self):
+        return len(self.premises)
+
+
+def load_data_snli(batch_size, num_steps):
+    num_workers = get_dataloader_workers()
+    data_dir = download_extract('SNLI')
+    train_data = read_snli(data_dir, is_train=True)
+    test_data = read_snli(data_dir, is_train=False)
+    train_set = SNLIDataset(train_data, num_steps)
+    test_set = SNLIDataset(test_data, num_steps, train_set.vocab)
+    train_iter = torch.utils.data.DataLoader(train_set, batch_size,
+                                             shuffle=True, num_workers=num_workers)
+    test_iter = torch.utils.data.DataLoader(test_set, batch_size,
+                                            shuffle=False, num_workers=num_workers)
+    return train_iter, test_iter, train_set.vocab
+
+
+def predict_snli(net, vocab, premise, hypothesis):
+    net.eval()
+    premise = torch.tensor([vocab[premise]], device=try_gpu())
+    hypothesis = torch.tensor([vocab[hypothesis]], device=try_gpu())
+    label = torch.argmax(net([premise.reshape((1, -1)),
+                              hypothesis.reshape((1, -1))], None), dim=1)
+    return 'entailment' if label == 0 else 'contradiction' if label == 1 else 'neutral'
+
+
+DATA_HUB['bert_base'] = (DATA_URL + 'bert.base.torch.zip',
+                         '225d66f04cae318b841a13d32af3acc165f253ac')
+DATA_HUB['bert.small'] = (DATA_URL + 'bert.small.torch.zip',
+                          'c72329e68a732bef0452e4b96a1c341c8910f81f')
